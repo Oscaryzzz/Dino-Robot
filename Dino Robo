@@ -1,0 +1,222 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import ctypes
+import cv2
+import numpy as np
+import time
+from multiprocessing import Process, Queue, Value, Manager
+import threading
+import pyrealsense2 as rs
+import torch
+from PIL import Image
+from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
+from episodeApp import EpisodeAPP
+import argparse
+
+# ========== Zero-Shot Detection and ROI Interaction ==========
+class GraspAgent:
+    def __init__(self, robot_ip, robot_port, classes, messages, running):
+        # Status and Parameters
+        self.robot_ip = robot_ip
+        self.robot_port = robot_port
+        self.classes = classes      # Shared target class list
+        self.messages = messages    # Shared message list
+        self.running = running      # Running flag
+        self.messages[0] = "Press 'R' to draw ROI"
+        self.center_point_queue = Queue()
+        self.status = Value(ctypes.c_int8, 0)  # 0: READY, 1: WORKING
+        self.select_roi = False
+        self.roi_points = []
+        self.roi = None
+        self.scale = 0.7
+        self.frame_width, self.frame_height = 1280, 720
+
+    # ---------- Object Detection ----------
+    def grounding_dino(self, image, classes):
+        # Load model and return detection results
+        processor = AutoProcessor.from_pretrained("./grounding-dino-base")
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(
+            "./grounding-dino-base"
+        ).to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        text = "".join(f"{c}." for c in classes)
+        image_pil = Image.fromarray(image)
+        inputs = processor(images=image_pil, text=text, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            outputs = model(**inputs)
+        return processor.post_process_grounded_object_detection(
+            outputs, inputs.input_ids,
+            box_threshold=0.4, text_threshold=0.4,
+            target_sizes=[image_pil.size[::-1]]
+        )
+
+    # ---------- ROI Drawing Callback ----------
+    def mouse_callback(self, event, x_display, y_display, flags, _):
+        if self.select_roi and event == cv2.EVENT_LBUTTONDOWN:
+            x = min(int(x_display / self.scale), self.frame_width - 1)
+            y = min(int(y_display / self.scale), self.frame_height - 1)
+            self.roi_points.append((x, y))
+            self.messages[0] = f"Point {len(self.roi_points)}: ({x}, {y})"
+            if len(self.roi_points) == 2:
+                (x1, y1), (x2, y2) = self.roi_points
+                self.roi = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+                self.select_roi = False
+                self.messages[0] = "ROI set: Enter classes"
+
+    # ---------- Real-time Detection Video Stream ----------
+    def realsense_video(self):
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.depth, self.frame_width, self.frame_height, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color, self.frame_width, self.frame_height, rs.format.bgr8, 30)
+        align = rs.align(rs.stream.color)
+        pipeline.start(config)
+        cv2.namedWindow('Detection', cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback('Detection', self.mouse_callback)
+        try:
+            while self.running.value:
+                start_time = time.time()
+                frames = align.process(pipeline.wait_for_frames())
+                depth_frame = frames.get_depth_frame()
+                color_frame = frames.get_color_frame()
+                color_image = np.asanyarray(color_frame.get_data())
+                intrinsics = color_frame.profile.as_video_stream_profile().intrinsics
+
+                # Draw ROI
+                if self.roi:
+                    x1, y1, x2, y2 = self.roi
+                    cv2.rectangle(color_image, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+                class_list = list(self.classes)
+                object_detected = False
+                if class_list:
+                    image = color_image
+                    offset = (0, 0)
+                    if self.roi:
+                        x1, y1, x2, y2 = self.roi
+                        image = color_image[y1:y2, x1:x2]
+                        offset = (x1, y1)
+                    results = self.grounding_dino(image, class_list)
+                    for result in results:
+                        for box, label, score in zip(result['boxes'], result['labels'], result['scores']):
+                            left, top, right, bottom = map(int, box)
+                            left += offset[0]; right += offset[0]; top += offset[1]; bottom += offset[1]
+                            cv2.rectangle(color_image, (left, top), (right, bottom), (0, 255, 0), 2)
+                            cv2.putText(color_image, f"{label} {score:.2f}", (left, top-5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                            center_x, center_y = (left + right) // 2, (top + bottom) // 2
+                            distance = depth_frame.get_distance(center_x, center_y)
+                            xyz_coordinates = rs.rs2_deproject_pixel_to_point(intrinsics, [center_x, center_y], distance)
+                            cv2.circle(color_image, (center_x, center_y), 5, (0, 0, 255), -1)
+                            cv2.putText(color_image, f"X:{xyz_coordinates[0]:.2f} Y:{xyz_coordinates[1]:.2f} Z:{xyz_coordinates[2]:.2f}",
+                                        (center_x + 10, center_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                            while not self.center_point_queue.empty():
+                                try: self.center_point_queue.get_nowait()
+                                except: break
+                            self.center_point_queue.put(xyz_coordinates)
+                            object_detected = True
+                    if not object_detected:
+                        self.messages[0] = f"Classes: {class_list} Not detected"
+
+                # Information overlay
+                fps = 1.0 / (time.time() - start_time)
+                cv2.putText(color_image, f"FPS: {fps:.2f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                robot_state = "WORKING" if self.status.value else "READY"
+                cv2.putText(color_image, f"ROBOT: {robot_state}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                            (0, 0, 255) if self.status.value else (0, 255, 0), 2)
+                cv2.putText(color_image, f"STATUS: {self.messages[0]}", (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                            (255, 255, 255), 2)
+
+                # Depth and color concatenation
+                depth_map = np.asanyarray(depth_frame.get_data())
+                depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_map, alpha=0.14), cv2.COLORMAP_JET)
+                combined_image = np.hstack((color_image, depth_colormap))
+                display_image = cv2.resize(combined_image, (0, 0), fx=self.scale, fy=self.scale)
+                cv2.imshow('Detection', display_image)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    self.running.value = False
+                    break
+                if key == ord('r'):
+                    self.select_roi = True; self.roi_points = []; self.roi = None
+                    self.messages[0] = "Press 'R' then click two points"
+                if key == ord('c'):
+                    self.roi = None; self.messages[0] = "Press 'R' to draw ROI"
+        finally:
+            pipeline.stop(); cv2.destroyAllWindows()
+
+    # ---------- Robot Grasping ----------
+    def episode_robot_grasp(self):
+        transform_path = os.path.join("./save_parms", "camera2base.npy")
+        if not os.path.exists(transform_path):
+            self.messages[0] = "Error: cannot load transform"
+            print("Error: cannot load transform")
+            running.value = False
+            return
+        transformation_matrix = np.load(transform_path)
+        suction_offset = 60
+        robot = EpisodeAPP(ip=self.robot_ip, port=self.robot_port)
+        while self.running.value:
+            class_list = list(self.classes)
+            if class_list:
+                self.messages[0] = f"Classes: {class_list} waiting detection"
+                while not self.center_point_queue.empty():
+                    try: self.center_point_queue.get_nowait()
+                    except: break
+                try:
+                    target_point = self.center_point_queue.get(timeout=1)
+                except:
+                    continue
+                time.sleep(1)
+                if target_point and self.running.value:
+                    self.status.value = 1
+                    self.messages[0] = f"Classes: {class_list} grasping"
+                    point_homogeneous = np.ones(4); point_homogeneous[:3] = target_point
+                    world_point = transformation_matrix @ point_homogeneous
+                    approach_position = [world_point[0], world_point[1], world_point[2] + suction_offset + 100]
+                    grasp_position = [world_point[0], world_point[1], world_point[2] + suction_offset]
+                    robot.move_xyz_rotation(approach_position, [180, 0, 90], rotation_order="xyz", speed_ratio=1)
+                    robot.move_xyz_rotation(grasp_position, [180, 0, 90], rotation_order="xyz", speed_ratio=1)
+                    robot.gripper_on()
+                    robot.move_xyz_rotation(approach_position, [180, 0, 90], rotation_order="xyz", speed_ratio=1)
+                    robot.move_xyz_rotation([140, -300, 300], [180, 0, 90], rotation_order="xyz", speed_ratio=1)
+                    robot.gripper_off()
+                    self.messages[0] = "Input classes"
+                    self.classes[:] = []
+                    self.status.value = 0
+            time.sleep(0.1)
+
+    # ---------- Main Process ----------
+    def run(self):
+        video_process = Process(target=self.realsense_video)
+        robot_process = Process(target=self.episode_robot_grasp)
+        video_process.start(); robot_process.start()
+        video_process.join(); robot_process.join()
+
+# ========== Script Entry Point ==========
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Grasp script auto-grasp current detection")
+    parser.add_argument('--ip', default='localhost', help='Robot IP address')
+    parser.add_argument('--port', type=int, default=12345, help='Robot port number')
+    args = parser.parse_args()
+    manager = Manager()
+    shared_classes = manager.list()
+    shared_messages = manager.list([""])
+
+    # Running flag
+    running = Value(ctypes.c_bool, True)
+
+    def input_thread():
+        while running.value:
+            user_input = input("Enter classes (comma-separated) or 'q' to quit: ")
+            if user_input.strip().lower() == 'q':
+                shared_messages[0] = "Input classes"
+                running.value = False
+                break
+            new_classes = [class_name.strip() for class_name in user_input.split(',') if class_name.strip()]
+            shared_classes[:] = new_classes if new_classes else []
+            shared_messages[0] = f"Classes: {shared_classes[:]} detected" if new_classes else "Input classes"
+
+    threading.Thread(target=input_thread, daemon=True).start()
+    agent = GraspAgent(args.ip, args.port, shared_classes, shared_messages, running)
+    agent.run()
