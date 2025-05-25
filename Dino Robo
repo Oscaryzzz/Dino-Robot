@@ -19,9 +19,9 @@ class GraspAgent:
         # Status and Parameters
         self.robot_ip = robot_ip
         self.robot_port = robot_port
-        self.classes = classes      # Shared target class list
-        self.messages = messages    # Shared message list
-        self.running = running      # Running flag
+        self.classes = classes      
+        self.messages = messages    
+        self.running = running     
         self.messages[0] = "Press 'R' to draw ROI"
         self.center_point_queue = Queue()
         self.status = Value(ctypes.c_int8, 0)  # 0: READY, 1: WORKING
